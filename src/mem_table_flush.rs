@@ -5,6 +5,7 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::db::DbInner;
+use crate::db::TaskIdentifier::MemtableFlusherTask;
 use crate::db_state::SsTableId;
 use crate::error::SlateDBError;
 use crate::manifest_store::FenceableManifest;
@@ -110,11 +111,17 @@ impl DbInner {
                                 Ok(_) => {
                                     this.db_stats.immutable_memtable_flushes.inc();
                                 }
-                                Err(err) => error!("error from memtable flush: {}", err),
+                                Err(err) => {
+                                    let mut wguard = this.task_errors.write();
+                                    wguard.insert(MemtableFlusherTask, err.to_string());
+                                    error!("error from memtable flush: {}", err)
+                                },
                             }
                         }
                     }
                     msg = rx.recv() => {
+                        // change this panic to set error
+                        // or should we do catch_unwind?
                         let msg = msg.expect("channel unexpectedly closed");
                         match msg {
                             MemtableFlushThreadMsg::Shutdown => {
@@ -126,7 +133,11 @@ impl DbInner {
                                     Ok(_) => {
                                         this.db_stats.immutable_memtable_flushes.inc();
                                     }
-                                    Err(err) => error!("error from memtable flush: {}", err),
+                                    Err(err) => {
+                                        let mut wguard = this.task_errors.write();
+                                        wguard.insert(MemtableFlusherTask, err.to_string());
+                                        error!("error from memtable flush: {}", err)
+                                    },
                                 }
                                 if let Some(rsp) = rsp {
                                     _ = rsp.send(result)
@@ -138,6 +149,8 @@ impl DbInner {
             }
 
             if let Err(err) = flusher.write_manifest_safely().await {
+                let mut guard = this.task_errors.write();
+                guard.insert(MemtableFlusherTask, err.to_string());
                 error!("error writing manifest on shutdown: {}", err);
             }
         }))

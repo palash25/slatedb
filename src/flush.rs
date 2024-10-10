@@ -4,6 +4,7 @@ use tokio::runtime::Handle;
 use tokio::select;
 
 use crate::db::DbInner;
+use crate::db::TaskIdentifier::WalFlusherTask;
 use crate::db_state;
 use crate::db_state::SsTableHandle;
 use crate::error::SlateDBError;
@@ -93,7 +94,11 @@ impl DbInner {
                 select! {
                   // Tick to freeze and flush the memtable
                   _ = ticker.tick() => {
-                    _ = this.flush().await;
+                    if let Err(err) = this.flush().await {
+                        let mut wguard = this.task_errors.write();
+                        wguard.insert(WalFlusherTask, err.to_string());
+                    };
+
                   }
                   msg = rx.recv() => {
                         let msg = msg.expect("channel unexpectedly closed");

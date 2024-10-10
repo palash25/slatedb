@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -13,6 +14,7 @@ use crate::compactor::CompactorMainMsg::Shutdown;
 use crate::compactor_executor::{CompactionExecutor, CompactionJob, TokioCompactionExecutor};
 use crate::compactor_state::{Compaction, CompactorState};
 use crate::config::CompactorOptions;
+use crate::db::TaskIdentifier;
 use crate::db_state::{SortedRun, SsTableHandle};
 use crate::error::SlateDBError;
 use crate::manifest_store::{FenceableManifest, ManifestStore, StoredManifest};
@@ -43,6 +45,7 @@ impl Compactor {
         options: CompactorOptions,
         tokio_handle: Handle,
         db_stats: Arc<DbStats>,
+        task_error: Arc<RwLock<HashMap<TaskIdentifier, String>>>,
     ) -> Result<Self, SlateDBError> {
         let (external_tx, external_rx) = crossbeam_channel::unbounded();
         let (err_tx, err_rx) = tokio::sync::oneshot::channel();
@@ -55,6 +58,7 @@ impl Compactor {
                 tokio_handle,
                 external_rx,
                 db_stats,
+                task_error,
             );
             let mut orchestrator = match load_result {
                 Ok(orchestrator) => orchestrator,
@@ -93,6 +97,7 @@ struct CompactorOrchestrator {
     external_rx: crossbeam_channel::Receiver<CompactorMainMsg>,
     worker_rx: crossbeam_channel::Receiver<WorkerToOrchestratorMsg>,
     db_stats: Arc<DbStats>,
+    task_error: Arc<RwLock<HashMap<TaskIdentifier, String>>>,
 }
 
 impl CompactorOrchestrator {
@@ -103,6 +108,7 @@ impl CompactorOrchestrator {
         tokio_handle: Handle,
         external_rx: crossbeam_channel::Receiver<CompactorMainMsg>,
         db_stats: Arc<DbStats>,
+        task_error: Arc<RwLock<HashMap<TaskIdentifier, String>>>,
     ) -> Result<Self, SlateDBError> {
         let options = Arc::new(options);
         let stored_manifest =
@@ -130,6 +136,7 @@ impl CompactorOrchestrator {
             external_rx,
             worker_rx,
             db_stats,
+            task_error,
         };
         Ok(orchestrator)
     }
@@ -146,7 +153,6 @@ impl CompactorOrchestrator {
     fn run(&mut self) {
         let ticker = crossbeam_channel::tick(self.options.poll_interval);
         let db_runs_log_ticker = crossbeam_channel::tick(Duration::from_secs(10));
-
         // Stop the loop when the executor is shut down *and* all remaining
         // `worker_rx` messages have been drained.
         while !(self.executor.is_stopped() && self.worker_rx.is_empty()) {
@@ -156,14 +162,28 @@ impl CompactorOrchestrator {
                 }
                 recv(ticker) -> _ => {
                     if !self.executor.is_stopped() {
-                        self.load_manifest().expect("fatal error loading manifest");
+                        if let Err(err) = self.load_manifest() {
+                            let mut wguard = self.task_error.write();
+                            wguard.insert(TaskIdentifier::CompactorThread, err.to_string());
+                        };
                     }
                 }
                 recv(self.worker_rx) -> msg => {
+                    // Why the expect here?
                     let WorkerToOrchestratorMsg::CompactionFinished(result) = msg.expect("fatal error receiving worker msg");
                     match result {
-                        Ok(sr) => self.finish_compaction(sr).expect("fatal error finishing compaction"),
-                        Err(err) => error!("error executing compaction: {:#?}", err)
+                        Ok(sr) => {
+                            if let Err(err) = self.finish_compaction(sr) {
+                                let mut wguard = self.task_error.write();
+                                wguard.insert(TaskIdentifier::CompactorThread, err.to_string());
+                                error!("error finishing compaction: {:#?}", err)
+                            }
+                        },
+                        Err(err) => {
+                            let mut wguard = self.task_error.write();
+                            wguard.insert(TaskIdentifier::CompactorThread, err.to_string());
+                            error!("error executing compaction: {:#?}", err)
+                        }
                     }
                 }
                 recv(self.external_rx) -> _ => {
@@ -292,6 +312,8 @@ impl CompactorOrchestrator {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
     use std::future::Future;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -321,8 +343,12 @@ mod tests {
         let options = db_options(Some(compactor_options()));
         let (_, manifest_store, table_store, db) = build_test_db(options).await;
         for i in 0..4 {
-            db.put(&[b'a' + i as u8; 16], &[b'b' + i as u8; 48]).await;
-            db.put(&[b'j' + i as u8; 16], &[b'k' + i as u8; 48]).await;
+            db.put(&[b'a' + i as u8; 16], &[b'b' + i as u8; 48])
+                .await
+                .unwrap();
+            db.put(&[b'j' + i as u8; 16], &[b'k' + i as u8; 48])
+                .await
+                .unwrap();
         }
 
         // when:
@@ -374,7 +400,7 @@ mod tests {
             .block_on(StoredManifest::load(manifest_store.clone()))
             .unwrap()
             .unwrap();
-        rt.block_on(db.put(&[b'a'; 32], &[b'b'; 96]));
+        rt.block_on(db.put(&[b'a'; 32], &[b'b'; 96])).unwrap();
         rt.block_on(db.close()).unwrap();
         let (_, external_rx) = crossbeam_channel::unbounded();
         let mut orchestrator = CompactorOrchestrator::new(
@@ -384,6 +410,7 @@ mod tests {
             rt.handle().clone(),
             external_rx,
             db.metrics(),
+            Arc::new(RwLock::new(HashMap::new())),
         )
         .unwrap();
         let l0_ids_to_compact: Vec<SourceId> = orchestrator
@@ -391,7 +418,7 @@ mod tests {
             .db_state()
             .l0
             .iter()
-            .map(|h| SourceId::Sst(h.id.unwrap_compacted_id()))
+            .map(|h: &crate::db_state::SsTableHandle| SourceId::Sst(h.id.unwrap_compacted_id()))
             .collect();
         // write another l0
         let db = rt
@@ -401,7 +428,7 @@ mod tests {
                 os.clone(),
             ))
             .unwrap();
-        rt.block_on(db.put(&[b'j'; 32], &[b'k'; 96]));
+        rt.block_on(db.put(&[b'j'; 32], &[b'k'; 96])).unwrap();
         rt.block_on(db.close()).unwrap();
         orchestrator
             .submit_compaction(Compaction::new(l0_ids_to_compact.clone(), 0))
